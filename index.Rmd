@@ -1,0 +1,239 @@
+# Exercise Manner Prediction
+## Introduction
+This is the submission by Arnold Cross of the final project in the coursera class, "Practical Machine Learning", offered by the Johns Hopkins University.
+
+### Assignment
+A training dataset and a test dataset were provided. Each dataset consists of readings from accelerometers, ring laser gyros and magnetometers.  Those sensors were worn at specific locations on the bodies of people performing weight-lifting curls in five different manners.  Each manner of performing the curls is designated a classe letter from A to E.  The assignment was to create a model from the training data to predict the classe letters from the test data using the other variables.
+
+### Approach
+I initially approached this assignment without looking at the test data.  I treated the assignment as if I was developing a model that would be applied to datasets collected in the future in the same manner as the training data.  I assumed that was what the test dataset represented and that it would look much like the training dataset without classe values.  After I did extensive work and was almost finished developing an intricate prediction model, I looked at the test data and discovered that my assumption was wrong.  The optimal solution turned out to be trivial.  It is explained in the __Test Data Analysis__ section below.  The modeling described in the __Training Data Analysis__ section turned out to be unnecessary.  I left it in this report, because it represents most of the work that I did.
+
+#### Style Note
+In this report I present code before I provide the text describing the code.  That allows calculated values to be used in the text.
+
+## Training Data Analysis
+For my solution to the project, skip to the __Test Data Analysis__ section below.  This __Training Data Analysis__ section is presented for completeness, because it describes the work that consumed most of my time.  The project solution turned out to be trivial, and it is presented in the __Test Data Analysis__ section.
+
+### Load the Training Data
+```{r results="hide"}
+suppressPackageStartupMessages({
+   library(caret)
+   library(randomForest)
+})
+set.seed(19813062) # The United States national debt in millions, 7 Nov 2016.
+numSam          <- nrow( pmlTrain  <- read.csv("pml-training.csv") )
+numberOfWindows <- length( unique(pmlTrain$num_window) )
+```
+```{r}
+numberOfWindows == nrow(winClasse<-unique( pmlTrain[,c("num_window", "classe")] ))
+```
+I loaded the training data and reviewed it.  There are `r numSam` data samples.  I could see that each repetition of the exercise was designated as a numbered "window", and there were `r numberOfWindows` windows.
+
+### Clean the Training Data
+```{r removeNAs, cache=TRUE}
+pmlNA     <- is.na(pmlTrain)
+summary(a <- apply( !pmlNA[ ,naAny<-apply(pmlNA, 2, any) ], 2, sum ))
+n         <- sum(naAny)
+newTrain  <- pmlTrain[!naAny]
+```
+Some measurements are summary values for whole windows.  Those are the only measurements with NA values.  Each one has `r max(a)` numeric values.  Since that represents fewer than half of the windows, I decided to eliminate those measurements.  There are `r n` of them.
+```{r removeSummaryFactors, cache=TRUE}
+pmlEmpty  <- newTrain[, !sapply(newTrain, is.numeric)] == ""
+summary(a <-apply( !pmlEmpty[ ,empAny<-apply(pmlEmpty, 2, any) ], 2, sum ))
+n         <- sum(empAny)
+toRemove  <- paste0( paste0("^", names(empAny[empAny]), "$"), collapse="|" )
+newTrain  <- newTrain[grep( toRemove, names(newTrain), invert=T )]
+```
+There are other summary measurements that do not have NA values, but they import as factors with mostly "" values.  Again we see that each one has `r max(a)` valid values.  There are `r n` of them, and I eliminated them.
+```{r removeOthers, cache=TRUE}
+numberRemaining1 <- ncol(newTrain)
+names(newTrain)
+someNames        <- "^(X|user|raw|cvtd|num|new)"
+newTrain         <- newTrain[grep( someNames, names(newTrain), invert=T )]
+numberRemaining2 <- ncol(newTrain)
+```
+This left `r numberRemaining1` measurements, from which I removed a few more that I didn't think should be relevant, mostly timestamps.  user_name could be considered relevant to this assignment, but I felt it best if the model could identify the exercise classe on data from an unknown individual.  I also removed the window number, assuming that the test data would have its own window numbers.  This left `r numberRemaining2` measurements in the test dataset, including the outcome, classe.
+
+### Exploratory Model
+```{r firstExploratory, cache=TRUE}
+sbst      <- sample(numSam, numSam%/%6) # take a subset to reduce time
+startTM   <- Sys.time()
+explorMod <- randomForest(classe ~., data=newTrain, subset=sbst, ntree=200   ,
+                          mtry=9   , replace=F    , nodesize=3 , importance=T)
+runTime1  <- Sys.time() - startTM
+```
+To eliminate unimportant measurements, I used a subset of the data to build a random forest model with parameters set for rapid execution.  That model took `r runTime1` seconds to build.  Before eliminating measurements of low importance, I decided to check for measurements that are correlated with each other.  Highly correlated measurements dilute each other's importance, so they may appear less important than they really are.  Two highly correlated measurements can be added together to create a single combined measurement with higher importance than either of the original measurements.
+
+### Correlation and Importance
+```{r identifyHighCorrelation, cache=TRUE}
+iClasse      <- grep("classe", names(newTrain)) # col index of classe
+corMat       <- cor(newTrain[,-iClasse])
+diag(corMat) <- 0
+corThresh    <- 0.8
+numMeas      <- ncol(corMat)
+hiCor        <- matrix( as.integer(corMat/corThresh), ncol=numMeas )
+whichHiCor   <- which(hiCor != 0, arr.ind=T)    # two column matrix
+hiCorList    <- lapply( 1:numMeas, function(i) {whichHiCor[ whichHiCor[,1]==i, 2 ]} )
+measImp      <- importance(explorMod)[,"MeanDecreaseGini"]
+impThresh    <- quantile(measImp, impQuant <- 0.4)
+measSD       <- apply(newTrain[,-iClasse], 2, sd)
+ppVar        <- character(0)                    # pp stands for preprocess
+columns2rem  <- integer(0)
+hcl          <- hiCorList
+```
+After creating a correlation matrix among all discriminant measurements, I applied a threshold of `r corThresh` to create a matrix of positive and negative ones and zeros, identifying which measurements are highly correlated.  From that, I extracted the index pairs of the highly correlated measurements.  I was then able to make a list with a vector for each measurement indicating by index number which other measurements it is highly correlated with.  I set an importance threshold based on the `r impQuant` quantile of the importances.  I obtained the standard deviations of all measurements and initialized some variables.  I was then ready for a loop to remove unimportant measurements that are not correlated with anything and to modify all the measurements that have correlations.
+```{r selectToRemove, cache=TRUE}
+for (i in order(measImp)) {
+   hcVec <- hiCorList[[i]]         # indices of highly correlated measurements
+
+   if ( length(hcl[[i]]) ) {
+      thisName <- names(measSD[i])   # measSD is used just to access the names
+      ppVar    <- c(ppVar, thisName) # from low to high importance
+      thisFac  <- measImp[thisName] / measSD[thisName]
+      thisFac  <- c(thisFac, hiCor[i, hcVec] * measImp[hcVec] / measSD[hcVec]) # vector
+
+      corVar   <- if ( exists("corVar") ) {
+                  c( corVar,  setNames(list( names(measSD[hcVec]) ), thisName) )
+                  } else {    setNames(list( names(measSD[hcVec]) ), thisName) }
+
+      scaleFac <- if ( exists("scaleFac") ) {
+                  c( scaleFac, setNames(list( thisFac ), thisName) )
+                  } else {     setNames(list( thisFac ), thisName) } # list
+
+      for (hc in hcVec) { hiCorList[[hc]] <- hiCorList[[hc]][ hiCorList[[hc]]!=i ] }
+   } else {
+      if (measImp[i] < impThresh) columns2rem <- c(columns2rem, i)
+   }
+}        # hiCorList has bottom-up correlations; hcl has two-way correlations
+```
+This loop looks at each measurement in importance order, from least important to most important.  It checks to see if the measurement is highly correlated with any other measurements.  If it is not, then it gets either deleted or left alone, depending on whether it exceeds the importance threshhold.  In order to maintain the indexing of the measurements, they are not deleted in the loop.  Instead, a vector accumulates the index numbers of the columns to be removed from the dataframe.
+
+If the measurement is correlated with another one, then it is flagged for preprocessing.  To combine the correlated measurements, I decided that I need to normalize their scaling, so one does not excessively dominate the new value.  For that, I divide each measurement by its standard deviation.  But, I weight the contribution of each measurement according to its importance.  I also use the hiCor matrix to make the scale factor negative for inversely correlated measurements.  The loop does not combine the measurements in the dataframe.  Instead, it compiles a list of scale factor vectors.  Each such vector has a scale factor for its indexed measurement and a scale factor for each higher importance measurement with which it correlates.  The top-down correlations are stripped from hiCorList as the loop proceeds up the importance ladder.
+
+### Preprocessing
+```{r removeMeasurements, cache=TRUE}
+for ( i in sort(columns2rem, decreasing=T) ) { newTrain[i] <- NULL }
+```
+A one-line loop removes the uncorrelated, unimportant measurements.  Then, correlated measurements are ready to be combined.  I used a constructor function to construct the Prepoc() function, because the same preprocessing needs to be done with the test data (I thought at the time).
+```{r preprocessing, cache=TRUE}
+if ( length(ppVar) ) {       # if there where any high correlations
+   Constructor <- function() {
+      pv  <- ppVar    # vector of measurement names for preprocessing, low to high
+      cv  <- corVar   # list of correlated name vectors
+      sf  <- scaleFac # list of scale factor vectors
+      msd <- measSD   # vector of standard deviations
+      cm  <- corMat   # matrix of correlations
+
+      Preproc <<- function(datFra) {
+         if ( missing(datFra) ) {
+            cat("\nThis function takes one argument, a dataframe of",
+                "covariates.\nIt returns the same dataframe with certain",
+                "columns modified.\nThe dataframe must have numeric columns",
+                "with the following names.\n", sep="")
+            return( unique(c( pv, unlist(cv) )) )
+         }
+         newDF <- datFra
+
+         for (mName in pv) {
+            sumVec <- c(mName, cv[[mName]])
+            newDF[mName] <- apply( datFra[sumVec], 1,
+                                function(x) {sum(x * sf[[mName]])} )
+            cvVec        <- cv[[mName]]
+            f1           <- function(x) { x/msd[cvVec] }
+            newDF[cvVec] <- t( apply(datFra[cvVec], 1, f1) -
+                            (cm[mName,cvVec] %o% datFra[,mName]) / msd[mName] )
+         }
+      newDF
+      }  # end of function Preproc
+   }     # end of function constructor
+   Constructor()
+   cat("A function, Preproc() has been created.  The test data needs to be
+          run through that function before predicting with the model.\n")
+   newTrain <- Preproc(newTrain)
+} else {
+   if ( exists("Preproc") ) rm(Preproc)
+   cat("None of the covariates had high correlations, so a preprocessing
+          function was not created.  The model may be used directly on the test
+          data.")
+}
+```
+If no measurements were correlated with each other, then ppVar is empty, and the preprocessing can be skipped.  Otherwise, Preproc() accepts the measurements dataframe and returns a new measurements dataframe.  Just to make the function simpler, I decided to return a new dataframe with the same column names as the input dataframe despite the fact that the function changes some of the values and their meanings.
+
+The workhorse of the function is a loop which takes the name of each measurment that is flagged for preprocessing, from least important to most important.  A vector is created with that measurement name and the names of all higher importance vectors with which it is correlated.  That measurement is then replaced in the new dataframe by a measurement consisting of the scaled sums of the correlated measurements.  The measurement values are taken from datFra, the input dataframe, which does not get overwritten.  So, if the mName measurement has already been overwritten in newDF, the output dataframe, by a difference measurement to be discussed in the next paragraph, then that difference is overwritten by the new sum.  This ensures that all higher importance information is retained in cases where more than two measurements correlate with each other.
+
+I decided that among correlated measurements there may be good information in their uncorrelated components.  To extract that, I decided to take the difference from each pair of correlated measurements after normalizing the scales by their standard deviations.  In this case, I did not weight according to importance.  I assumed that the measurements are dominated by their correlated components, so the new information I am extracting probably did not show up in the earlier importance measures.  The formula that I wanted to implement can be conceptually expressed as:
+
+( datFra[cvVec] / msd[cvVec] ) - ( corMat[mName,cvVec] * datFra[mName] / msd[mName] )
+
+where the columns indexed by cvVec are treated term-by-term over the rows of the dataframe with the vectors identified by mName recycled across the columns.  The formula cannot be written that way, because R does not match up rows and columns the way my conceptual formula envisions.  Instead, I wrote an apply statement that took care of it.  If the mName measurement correlates with multiple higher importance measurements, then a difference vector is produced for each of the higher importance measurements.  The difference vectors replace the higher importance measurements.  This is okay, because the higher importance measurements have already been rolled into the sum which replaced the lower importance measurement.
+
+### Final Model
+```{r secondExploratory, cache=TRUE}
+sbst <- sample(numSam, numSam%/%3)
+startTM <- unclass( Sys.time() )
+reductionMod <- randomForest(classe ~., data=newTrain, subset=sbst, ntree=400,
+                                        mtry=7       , replace=F  , nodesize=2,
+                                        importance=T)
+runTime2 <- round(unclass( Sys.time() - startTM ))
+measImp  <- importance(reductionMod)[,"MeanDecreaseGini"]
+for (mName in names( measImp[measImp < quantile(measImp, impQuant <- 0.4)] )) {
+   newTrain[mName] <- NULL
+}
+```
+With the new covariates created from correlated measurements, I wanted to reduce the number of covariates by removing unimportant ones from the new dataset.  I created a new model from a subset of the data.  That took `r runTime2` seconds to run.  I remove all columns with importance less than the `r impQuant` quantile from the dataframe.
+```{r finalModel, cache=TRUE}
+startTM  <- unclass( Sys.time() )
+finalMod <- train(classe ~., data=newTrain)
+runTime3 <- round( (unclass( Sys.time() ) - startTM) / 60 )
+```
+```{r results='hide'}
+prFM <- print(finalMod)
+accuracyEstimateOOB <- max( as.numeric(prFM[,2]) )
+```
+Building the final model took `r runTime3` minutes.  With that model, I could run predictions on individual data samples.  The train function performs cross-validation, and it estimated my out-of-bag accuracy at `r accuracyEstimateOOB`.
+
+### Window Voting
+```{r}
+predProb  <- predict(finalMod, newdata=newTrain, type="prob")  # dataframe
+sumProb   <- apply(predProb, 2, function(x) {tapply(x, pmlTrain$num_window, sum)})
+                                                               # numeric matrix
+maxSum    <- apply(sumProb,  1, max)                           # numeric per window (vec)
+isMax     <- apply( sumProb, 2, function(x) {x == maxSum} )    # T/F per window (matrix)
+whichMax  <- apply( isMax,   1, function(x) {names(x[x])[1]} ) # classe for each window
+votedPred <- whichMax[as.character(pmlTrain$num_window)]       # classe for each sample
+notOneWin <- apply( isMax,   1, function(x) {sum(x) != 1} )    # T/F per window (vector)
+if ( any(notOneWin) )  {
+   notOne    <- notOneWin[as.character(pmlTrain$num_window)]   # T/F per sample
+   votedPred[notOne] <- as.character( predict(finalMod, newdata=newTrain[notOne,]) )
+}
+table(pmlTrain$classe, votedPred)
+```
+As I mentioned earlier, each exercise repetition is recorded in the data as a window of samples.  I still had not looked at the test data, but I assumed that it would be similar to the training data, with full repetitions recorded as data windows.  So, I decided to create a voting mechanism for predictions within a window.  This should bring the out-of-bag accuracy close to 100% for any window with multiple samples.  (I found that window 25 is the only window in the training set that has only one sample.)
+
+I get a dataframe of probabilities for the predictions, and I sum the probabilities for each window.  I find the classe which has the highest probability sum in each window, but there could be a tie for any given window.  I wanted whichmax to be a vector, not a list, so I let it take only the first classe as its value for any tie.  From that, I create a vector with the voted prediction for each sample.  Then, to deal with ties, I overwrite votedPred for any window that had a tie, using the result of a standard prediction run on the full dataset.  As the table shows, the resulting output had no errors on the training data.  I was going to turn the voting algorithm into a function, but I decided to look at the test data first.
+
+## Test Data Analysis
+```{r}
+numSam          <- nrow( pmlTest  <- read.csv("pml-testing.csv") )
+numberOfWindows <- length( unique(pmlTest$num_window) )
+numberOfWindows == numSam
+```
+To my surprise, the test set only has `r numSam` samples and the same number of windows.  In other words, it only has one sample per window.  So, there was no point in making a function for window voting.  On a whim, I checked the timestamps of the test data and compared them with the timestamps of the training data.
+```{r}
+trainWTN <- unique( pmlTrain[,c("num_window", "raw_timestamp_part_1", "user_name")] )
+testWN   <- pmlTest[,c("num_window", "user_name")]
+testTime <- pmlTest$raw_timestamp_part_1
+all(sapply( testTime, function(tt) { any(trainWTN[,2]==tt) } ))
+trainWin <- function(tt) {trainWTN[ trainWTN[,2]==tt, 1 ]}
+trainNam <- function(tt) {trainWTN[ trainWTN[,2]==tt, 3 ]}
+identical(testWN$num_window, sapply(testTime, trainWin) )
+identical(testWN$user_name,  sapply(testTime, trainNam) )
+```
+All the test timestamps matched training times and had the same window numbers as their matching training times.  They also had the same participant names.  It seems that the test data simply consists of samples extracted from the same dataset that created the training data.  That makes the solution trivial.  The project assignment specifically states, "You may use any of the other variables [other than 'classe'] to predict with."  That includes num_window, so the optimal prediction model is nothing but a look-up table.
+```{r}
+classeLookUp        <- winClasse$classe
+names(classeLookUp) <- winClasse$num_window
+testPred            <- classeLookUp[as.character(pmlTest$num_window)]
+data.frame( number=1:nrow(pmlTest), classe=testPred )
+```
+With such a trivial solution there is no need for cross validation, and the out of sample error should be zero.
